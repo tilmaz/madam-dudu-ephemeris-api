@@ -9,12 +9,19 @@ from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-# Swiss Ephemeris flags (MOSEPH = no ephemeris files needed on Render)
+# ============================
+# Config
+# ============================
+
+# Swiss Ephemeris flags
+# MOSEPH = no external ephemeris files needed (works well on Render)
 FLAGS = swe.FLG_MOSEPH | swe.FLG_SPEED
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+# Secrets / keys (set these in Render Environment Variables)
 API_KEY = os.getenv("API_KEY", "")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
+# Planet ids
 PLANETS = {
     "Sun": swe.SUN,
     "Moon": swe.MOON,
@@ -28,6 +35,7 @@ PLANETS = {
     "Pluto": swe.PLUTO,
 }
 
+# Major aspects
 ASPECTS = [
     ("☌", 0),
     ("⚹", 60),
@@ -36,6 +44,7 @@ ASPECTS = [
     ("☍", 180),
 ]
 
+# Simple orbs by transiting planet (starter defaults)
 ORB_BY_TRANSIT = {
     "Mercury": 1.5,
     "Venus": 1.5,
@@ -47,10 +56,19 @@ ORB_BY_TRANSIT = {
     "Pluto": 1.5,
 }
 
-app = FastAPI(title="Madam Dudu Ephemeris API", version="1.1.0")
+# ============================
+# App
+# ============================
 
+app = FastAPI(title="Madam Dudu Ephemeris API", version="1.1.1")
+
+
+# ============================
+# Helpers
+# ============================
 
 def auth(x_api_key: str | None):
+    """If API_KEY is set, require matching x-api-key header."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -69,16 +87,21 @@ def to_jd_ut(dt_utc: datetime) -> float:
 
 
 def planet_lon(jd_ut: float, planet_id: int) -> float:
-    lon, lat, dist, speed_lon = swe.calc_ut(jd_ut, planet_id, FLAGS)[0]
+    """
+    Swiss Ephemeris calc_ut return format varies by flags/version.
+    Safest: read longitude from index 0 of the returned position array.
+    """
+    res = swe.calc_ut(jd_ut, planet_id, FLAGS)[0]  # array-like
+    lon = float(res[0])
     return lon % 360.0
 
 
 def houses_placidus(jd_ut: float, lat: float, lon: float):
-    # 'P' = Placidus
+    """Placidus houses + angles."""
     cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b"P")
-    asc = ascmc[0] % 360.0
-    mc = ascmc[1] % 360.0
-    return asc, mc, [c % 360.0 for c in cusps[1:]]  # 12 cusps
+    asc = float(ascmc[0]) % 360.0
+    mc = float(ascmc[1]) % 360.0
+    return asc, mc, [float(c) % 360.0 for c in cusps[1:]]  # 12 cusps
 
 
 def sign_index(lon: float) -> int:
@@ -86,6 +109,10 @@ def sign_index(lon: float) -> int:
 
 
 def aspect_hit(trans_lon: float, natal_lon: float, orb: float):
+    """
+    Checks whether trans_lon forms a major aspect to natal_lon within orb.
+    Returns (symbol, exact_angle, deviation) or None.
+    """
     d = (trans_lon - natal_lon) % 360.0
     if d > 180:
         d = 360 - d
@@ -100,9 +127,15 @@ def add_months_minus_one_day(start: date, months: int) -> date:
     return (start + relativedelta(months=months)) - timedelta(days=1)
 
 
-# ---------- Google Cloud helpers ----------
+# ============================
+# Google Cloud helpers
+# ============================
 
 def google_geocode(place: str):
+    """
+    City, Country -> (lat, lon, formatted_address)
+    Requires Geocoding API enabled.
+    """
     require_google_key()
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": place, "key": GOOGLE_MAPS_API_KEY}
@@ -123,9 +156,12 @@ def google_geocode(place: str):
 
 
 def google_timezone(lat: float, lon: float, when_utc: datetime) -> str:
+    """
+    lat/lon + timestamp -> timeZoneId (e.g., Europe/Istanbul)
+    Requires Time Zone API enabled.
+    """
     require_google_key()
     url = "https://maps.googleapis.com/maps/api/timezone/json"
-    # Time Zone API timestamp expects seconds since epoch (UTC)
     ts = int(when_utc.timestamp())
     params = {"location": f"{lat},{lon}", "timestamp": ts, "key": GOOGLE_MAPS_API_KEY}
     r = requests.get(url, params=params, timeout=20)
@@ -142,16 +178,22 @@ def google_timezone(lat: float, lon: float, when_utc: datetime) -> str:
     return tz_id
 
 
-# ---------- API schema ----------
+# ============================
+# Schemas
+# ============================
 
 class ComputeRequest(BaseModel):
     name: str = Field(..., description="Name label")
     birth_date: str = Field(..., description="YYYY-MM-DD")
-    birth_time: str | None = Field(None, description="HH:MM or ~HH:MM or None")
+    birth_time: str | None = Field(None, description="HH:MM or ~HH:MM or omitted")
     birth_place: str = Field(..., description="City, Country")
     start_date: str = Field(..., description="YYYY-MM-DD")
     months: int = Field(..., description="6 or 12")
 
+
+# ============================
+# Routes
+# ============================
 
 @app.get("/health")
 def health():
@@ -196,13 +238,18 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
     # Forecast window
     ed = add_months_minus_one_day(sd, payload.months)
 
+    # Month labels
     months_list = []
     cur = date(sd.year, sd.month, 1)
     while cur <= ed:
         months_list.append(cur.strftime("%B %Y"))
         cur = (cur + relativedelta(months=1))
 
-    # Natal calculations
+    # Timezone for birth place (use birth date noon UTC as a stable reference)
+    reference_utc = datetime(bd.year, bd.month, bd.day, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
+    tzname = google_timezone(lat, lon, reference_utc)
+
+    # Natal positions
     natal = {}
     asc = None
     mc = None
@@ -210,11 +257,6 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
     asc_stable = None
 
     if not birth_time_missing:
-        # We need timezone for birth moment; get it from Google Time Zone using birth date in UTC noon as reference.
-        # Then we convert actual local birth datetime to UTC.
-        reference_utc = datetime(bd.year, bd.month, bd.day, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
-        tzname = google_timezone(lat, lon, reference_utc)
-
         local = datetime(bd.year, bd.month, bd.day, bt.hour, bt.minute, 0, tzinfo=ZoneInfo(tzname))
         utc = local.astimezone(ZoneInfo("UTC"))
         jd = to_jd_ut(utc)
@@ -239,10 +281,7 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
             asc_stable = (s1 == s2 == s3)
 
     else:
-        # No birth time: compute at local noon for planet sign/aspect-level (houses not reliable)
-        reference_utc = datetime(bd.year, bd.month, bd.day, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
-        tzname = google_timezone(lat, lon, reference_utc)
-
+        # No birth time: compute planets at local noon for sign/aspect-level (houses not reliable)
         local_noon = datetime(bd.year, bd.month, bd.day, 12, 0, 0, tzinfo=ZoneInfo(tzname))
         utc_noon = local_noon.astimezone(ZoneInfo("UTC"))
         jd_noon = to_jd_ut(utc_noon)
@@ -250,7 +289,7 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
         for pname in ("Sun", "Moon", "Mercury", "Venus", "Mars"):
             natal[pname] = planet_lon(jd_noon, PLANETS[pname])
 
-    # Natal points used for transit aspects
+    # Natal points for aspect scanning
     natal_points = {
         "Sun": natal.get("Sun"),
         "Moon": natal.get("Moon"),
@@ -259,7 +298,7 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
         "Mars": natal.get("Mars"),
     }
 
-    # Only include Asc/MC if time is present and Asc is stable (or time not uncertain)
+    # Include Asc/MC only if time is present and Asc is stable (or time not uncertain)
     if asc is not None and (not time_uncertain or asc_stable):
         natal_points["Asc"] = asc
         natal_points["MC"] = mc
@@ -311,7 +350,7 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
                     else:
                         active[k] = ActiveWindow(tp, np, sym, ang, d, d, d, dev)
 
-        # close windows not seen today
+        # Close windows not seen today
         to_close = [k for k in list(active.keys()) if k not in seen]
         for k in to_close:
             aw = active.pop(k)
@@ -326,7 +365,7 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
 
         d += timedelta(days=1)
 
-    # close remaining
+    # Close remaining active windows
     for aw in active.values():
         if (aw.end - aw.start).days >= 1:
             events.append({
@@ -339,9 +378,13 @@ def compute(payload: ComputeRequest, x_api_key: str | None = Header(default=None
 
     return {
         "forecast_window": {"start": sd.isoformat(), "end": ed.isoformat(), "months": months_list},
-        "location": {"input": payload.birth_place, "resolved": place_display, "lat": lat, "lon": lon},
-        "birth_time": {"raw": payload.birth_time, "missing": birth_time_missing, "uncertain": time_uncertain,
-                       "asc_stable_within_20min": asc_stable},
+        "location": {"input": payload.birth_place, "resolved": place_display, "lat": lat, "lon": lon, "timezone": tzname},
+        "birth_time": {
+            "raw": payload.birth_time,
+            "missing": birth_time_missing,
+            "uncertain": time_uncertain,
+            "asc_stable_within_20min": asc_stable
+        },
         "system": {"zodiac": "Tropical", "houses_default": "Placidus"},
         "natal_snapshot": {
             "Sun_lon": natal.get("Sun"),
