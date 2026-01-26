@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: madam-dudu-ephemeris-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: API_KEY
+        generateValue: true
