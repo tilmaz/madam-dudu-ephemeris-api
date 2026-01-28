@@ -470,7 +470,15 @@ def compute_core(payload: ComputeRequest) -> dict:
     transits_out = events if detail == "full" else filter_events_clean(events)
 
     return {
-        "forecast_window": {"start": sd.isoformat(), "end": ed.isoformat(), "months": months_list},
+        # months_labels holds the month anchors used by the writer for month-by-month sections.
+        # A 12-month window can span parts of 13 calendar months (e.g., 2026-01-30 → 2027-01-29).
+        # We therefore keep both the requested duration and the label list.
+        "forecast_window": {
+            "start": sd.isoformat(),
+            "end": ed.isoformat(),
+            "months_requested": months,
+            "months_labels": months_list,
+        },
         "location": {"input": payload.birth_place, "resolved": place_display, "lat": lat, "lon": lon, "timezone": tzname},
         "birth_time": {"raw": payload.birth_time, "missing": birth_time_missing, "uncertain": time_uncertain, "asc_stable_within_20min": asc_stable},
         "system": {"zodiac": "Tropical", "houses_default": "Placidus"},
@@ -498,7 +506,8 @@ def to_gpt_text(result: dict) -> str:
     transits = result["transits"]
 
     lines = []
-    lines.append(f'FORECAST WINDOW: {fw["start"]} – {fw["end"]}  ({len(fw["months"])} months)')
+    # Display the user-requested duration, not the count of month labels (which can differ).
+    lines.append(f'FORECAST WINDOW: {fw["start"]} – {fw["end"]}  ({fw["months_requested"]} months)')
     lines.append(f'NATAL NAME: {result.get("name","")}')
     lines.append(f'LOCATION: {loc["resolved"]} (lat {loc["lat"]}, lon {loc["lon"]}) | TZ: {loc["timezone"]}')
     lines.append(f'BIRTH TIME: {bt["raw"] or "N/A"} | missing={bt["missing"]} | uncertain={bt["uncertain"]}')
