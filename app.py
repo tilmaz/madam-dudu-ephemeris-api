@@ -476,7 +476,7 @@ def compute_core(payload: ComputeRequest) -> dict:
         "forecast_window": {
             "start": sd.isoformat(),
             "end": ed.isoformat(),
-            "months_requested": months,
+            "months_requested": payload.months,
             "months_labels": months_list,
         },
         "location": {"input": payload.birth_place, "resolved": place_display, "lat": lat, "lon": lon, "timezone": tzname},
